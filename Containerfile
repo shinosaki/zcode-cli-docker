@@ -94,6 +94,7 @@ RUN git init -q /src \
 ENV npm_config_registry=${NPM_REGISTRY}
 RUN pnpm install --frozen-lockfile \
       --config.minimum-release-age="${MINIMUM_RELEASE_AGE_MINUTES}" \
+  --child-concurrency=1 \
   --network-concurrency=8 \
       --filter "@zcode/cli..." --filter "@zcode/server..." --filter "@zcode/web..."
 
