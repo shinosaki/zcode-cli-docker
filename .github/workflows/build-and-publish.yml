@@ -68,6 +68,7 @@ jobs:
             registry-1.docker.io:443
             index.docker.io:443
             production.cloudfront.docker.com:443
+            nodejs.org:443
             ghcr.io:443
             pkg-containers.githubusercontent.com:443
             npm.flatt.tech:443
