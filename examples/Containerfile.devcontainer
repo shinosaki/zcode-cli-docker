@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1.7
+# =============================================================================
+# Containerfile.devcontainer — COPY the pre-built zcode CLI into any base image
+#
+# Build zcode ONCE in the hardened pipeline (Containerfile + CI in this repo),
+# publish to GHCR, then embed the ALREADY-VERIFIED bytes into whatever base
+# image you actually work in — no rebuild, no separate toolchain.
+#
+#   hardened pipeline (16 GB runner)              your image
+#   ┌──────────────────────────────┐   COPY    ┌──────────────────────────┐
+#   │ ghcr.io/<owner>/zcode-cli    │ ────────▶ │ mcr.microsoft.com/       │
+#   │  /opt/zcode      (307 MB)    │           │ devcontainers/base:…     │
+#   │  /usr/local/bin/node (24.14.1)│          │  zcode just works        │
+#   │  /usr/local/bin/zcode        │           └──────────────────────────┘
+#   └──────────────────────────────┘
+#
+# VERIFIED empirically against devcontainers/base:bookworm (Debian 12):
+#   node v24.14.1 runs; `zcode --version` -> 3.15.1; `--help` renders;
+#   node-pty native prebuild dlopen OK; web server answers /api/server-info.
+#
+# Requirements on the target image (the ONLY hard constraints):
+#   * linux/amd64            — published image is amd64-only; the bundled
+#                              node-pty / ssh2 prebuilds are linux-x64
+#   * glibc >= 2.34          — ssh2's sshcrypto prebuild (node itself needs
+#                              only 2.28) → Debian 12+, Ubuntu 22.04+,
+#                              RHEL 9+ all qualify
+#   * libstdc++ GLIBCXX >= 3.4.22 — Debian 12 ships 3.4.30
+#   * NO pre-installed node needed — node 24.14.1 (the exact build the CLI was
+#     smoke-tested against) is copied from the zcode image itself.
+#
+# Supply-chain note: pin the SOURCE image by DIGEST, not by tag — the digest
+# is the exact byte-set your CI smoke-tested and cosign-signed. Obtain it via
+#   docker buildx imagetools inspect ghcr.io/<owner>/zcode-cli:v3.15.1
+# and (recommended) verify the signature before pinning:
+#   cosign verify ghcr.io/<owner>/zcode-cli@sha256:<digest> \
+#     --certificate-identity-regexp='^https://github\.com/<owner>/<repo>/' \
+#     --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+# Also consider pinning the TARGET base image by digest for full determinism.
+# =============================================================================
+
+# --- source stage: the published, hardened zcode image -----------------------
+# REPLACE the placeholder digest with the release digest you verified.
+ARG ZCODE_IMAGE=ghcr.io/OWNER/zcode-cli@sha256:REPLACE_WITH_RELEASE_DIGEST
+
+FROM ${ZCODE_IMAGE} AS zcode
+
+# --- target stage: your daily base image -------------------------------------
+FROM mcr.microsoft.com/devcontainers/base:bookworm
+# Variant: images that ALREADY ship Node 24.x (e.g. devcontainers/javascript-node)
+# may skip the node COPY below; the launcher resolves `node` from PATH.
+# Keeping the copied node is nevertheless RECOMMENDED: it pins the exact
+# runtime version the CLI was validated with, independent of the base image.
+
+# Runtime payload — identical layout to the standalone image:
+#   bin/zcode.mjs (launcher entry)  agent/ (CLI bundle)  server/  web/
+#   node_modules/ (incl. node-pty/ssh2 native prebuilds)
+COPY --from=zcode /opt/zcode /opt/zcode
+
+# devcontainers/base ships NO node. Copy the validated node binary
+# (self-contained, dynamically linked against glibc >= 2.28 only).
+COPY --from=zcode /usr/local/bin/node /usr/local/bin/node
+
+# The launcher shell shim (#!/bin/sh; exec node /opt/zcode/bin/zcode.mjs "$@").
+COPY --from=zcode /usr/local/bin/zcode /usr/local/bin/zcode
+
+# Same immutability posture as the standalone image: root-owned, world-readable
+# and executable, never writable — the CLI cannot modify its own runtime and
+# upgrades happen exclusively by re-pinning the digest above.
+RUN chmod -R a-w /opt/zcode
+
+# No USER line on purpose: the base image already runs as `vscode` (uid 1000).
+# /opt/zcode and /usr/local/bin/node are o+rx, so the non-root user runs them
+# as-is; CLI state (config, sessions) lives under $HOME, which vscode owns.
+
+# No ENTRYPOINT on purpose: this is a general-purpose workspace image — zcode
+# is invoked as a plain command (inside devcontainers, docker exec, CI, …):
+#   docker build -t dev-zcode -f examples/Containerfile.devcontainer .
+#   docker run --rm -it dev-zcode zcode --version          # -> 3.15.1
+#   docker run --rm -it -v "$PWD":/workspaces/proj -w /workspaces/proj dev-zcode zcode

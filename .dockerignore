@@ -1,0 +1,7 @@
+# Keep the build context minimal — no VCS, no docs, nothing but build inputs.
+.git
+.github
+README.md
+SECURITY.md
+*.zip
+scripts/smoke-test.sh

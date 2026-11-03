@@ -1,0 +1,33 @@
+name: pin-verify
+
+# Read-only validation on PRs (including Dependabot's and the update bot's).
+# Runs ONLY scripts/verify-pin.mjs: no secrets are exposed to the job, it does
+# not write anything, and pull_request checkouts are safe even for fork PRs.
+# Purpose: reviewers see pre-merge evidence that a pin change is well-formed
+# and that the tag still points at the pinned commit.
+
+on:
+  pull_request:
+    paths:
+      - "zcode-version.env"
+      - "Containerfile"
+      - "scripts/**"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify pins
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Check out the PR merge commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify pins (strict parse + tag -> commit against upstream)
+        run: node scripts/verify-pin.mjs

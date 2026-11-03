@@ -1,0 +1,204 @@
+name: upstream-update-check
+
+# Weekly update detection — DETECTION ONLY, NEVER PUBLISH.
+#
+# Flow (human-in-the-loop by design):
+#   1. scheduled job compares our pins against live upstream (git tags), the
+#      node base image tag line (new 24.14.x patches) and digest drift
+#   2. for each detected, cooling-off-passed change it opens a PR that changes
+#      exactly one file (zcode-version.env), each on its own branch cut from
+#      origin/main
+#   3. the PR itself is the notification (email / watchers / webhooks); a human
+#      reviews the diff evidence and merges
+#   4. the merge pushes to main, which triggers build-and-publish.yml
+#
+# Why no auto-merge: automatically shipping freshly-appeared upstream code is
+# exactly the supply-chain risk this pipeline exists to control. The PR gate
+# costs one click and preserves a reviewable decision point (see SECURITY.md).
+
+on:
+  schedule:
+    # Mondays 03:17 UTC — deliberately off the top of the hour.
+    # NOTE: GitHub disables scheduled workflows after 60 days of repository
+    # inactivity; any push (including these update PRs) keeps it alive.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-update-check
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Detect upstream + base image updates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the update branch
+      pull-requests: write # open the PR
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect updates (zcode tags, node patch tags, digest drift)
+        id: detect
+        run: |
+          set -euo pipefail
+          node scripts/check-upstream-update.mjs > /tmp/detect.json
+          jq -e . /tmp/detect.json > /dev/null
+          echo "upstream=$(jq -c '.upstream // empty' /tmp/detect.json)" >> "$GITHUB_OUTPUT"
+          echo "nodeUpdate=$(jq -c '.nodeUpdate // empty' /tmp/detect.json)" >> "$GITHUB_OUTPUT"
+          echo "digestDrift=$(jq -c '.digestDrift // empty' /tmp/detect.json)" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------
+      # Shared helpers for the PR steps below.
+      # * Each PR gets its own branch cut from origin/main (never from another
+      #   PR branch — two detected changes must be two independent decisions).
+      # * Branch names carry the run date; if a PR for today already exists we
+      #   skip instead of failing (a still-open PR from last week is a normal
+      #   state, not an error).
+      # * The push uses GIT_ASKPASS so the token never appears in argv or URLs.
+      # ---------------------------------------------------------------------
+      - name: Prepare git identity + askpass helper
+        if: steps.detect.outputs.upstream != '' || steps.detect.outputs.nodeUpdate != '' || steps.detect.outputs.digestDrift != ''
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # GIT_ASKPASS keeps the token out of argv/URLs (it is read from env
+          # at push time; the file itself contains only the variable name).
+          printf '#!/bin/sh\necho "${GH_TOKEN}"\n' > /tmp/askpass.sh
+          chmod 700 /tmp/askpass.sh
+          echo "GIT_ASKPASS=/tmp/askpass.sh" >> "$GITHUB_ENV"
+          echo "GIT_TERMINAL_PROMPT=0" >> "$GITHUB_ENV"
+
+      - name: Open zcode version bump PR
+        if: steps.detect.outputs.upstream != ''
+        env:
+          UPSTREAM: ${{ steps.detect.outputs.upstream }}
+        run: |
+          set -euo pipefail
+          TO_TAG="$(jq -r .toTag <<<"${UPSTREAM}")"
+          TO_COMMIT="$(jq -r .toCommit <<<"${UPSTREAM}")"
+          AGE_DAYS="$(jq -r .ageDays <<<"${UPSTREAM}")"
+          BRANCH="chore/zcode-${TO_TAG}-$(date +%Y%m%d)"
+          OPEN="$(gh pr list --head "${BRANCH}" --state open --json number | jq length)"
+          [ "${OPEN}" = "0" ] || { echo "PR for ${BRANCH} already open; skipping"; exit 0; }
+          git fetch origin main --quiet
+          git checkout -B "${BRANCH}" origin/main
+          node scripts/check-upstream-update.mjs --apply upstream
+          git add zcode-version.env
+          git diff --cached --quiet && { echo "nothing to commit; skipping"; exit 0; }
+          git commit -m "chore: bump zcode ${TO_TAG} (commit age ${AGE_DAYS}d)"
+          # --force is safe: the branch is always regenerated from origin/main
+          # (covers same-day reruns after a closed-unmerged PR; N1 from review)
+          git push --force "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          {
+            echo "## zcode ${TO_TAG} is ready for review"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| tag | \`${TO_TAG}\` |"
+            echo "| commit | \`${TO_COMMIT}\` |"
+            echo "| commit age | \`${AGE_DAYS}\` days (>= gate) |"
+            echo "| compare | $(jq -r .compareUrl <<<"${UPSTREAM}") |"
+            echo "| release | $(jq -r .releaseUrl <<<"${UPSTREAM}") |"
+            echo ""
+            echo "### Review checklist"
+            echo "1. Skim the upstream compare link for anything alarming"
+            echo "   (new dependencies, network egress, credential handling)."
+            echo "2. Merge this PR — the merge triggers build-and-publish, which"
+            echo "   re-verifies tag->commit, builds, smoke-tests, signs and only"
+            echo "   then publishes."
+            echo "3. CI failure after merge = pin verification caught a moved tag;"
+            echo "   investigate upstream instead of re-running blindly."
+          } > /tmp/pr-body.md
+          gh pr create \
+            --title "chore: bump zcode to ${TO_TAG}" \
+            --body-file /tmp/pr-body.md \
+            --label dependencies \
+            --head "${BRANCH}" \
+            --base main
+
+      - name: Open node base image bump PR (new 24.14.x patch)
+        if: steps.detect.outputs.nodeUpdate != ''
+        env:
+          NODE_UPDATE: ${{ steps.detect.outputs.nodeUpdate }}
+        run: |
+          set -euo pipefail
+          TO_TAG="$(jq -r .toTag <<<"${NODE_UPDATE}")"
+          TO_DIGEST="$(jq -r .toDigest <<<"${NODE_UPDATE}")"
+          BRANCH="chore/node-${TO_TAG%%-*}-$(date +%Y%m%d)"
+          OPEN="$(gh pr list --head "${BRANCH}" --state open --json number | jq length)"
+          [ "${OPEN}" = "0" ] || { echo "PR for ${BRANCH} already open; skipping"; exit 0; }
+          git fetch origin main --quiet
+          git checkout -B "${BRANCH}" origin/main
+          node scripts/check-upstream-update.mjs --apply node
+          git add zcode-version.env
+          git diff --cached --quiet && { echo "nothing to commit; skipping"; exit 0; }
+          git commit -m "chore: bump node base image to ${TO_TAG}"
+          # --force is safe: the branch is always regenerated from origin/main
+          # (covers same-day reruns after a closed-unmerged PR; N1 from review)
+          git push --force "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          {
+            echo "## Node.js base image patch update for review"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| new tag | \`${TO_TAG}\` |"
+            echo "| new digest | \`${TO_DIGEST}\` |"
+            echo ""
+            echo "A new patch release in the same 24.14.x line was published"
+            echo "(typically a Node.js security fix). The Containerfile digest pin"
+            echo "moves with the tag. Review and merge to rebuild."
+          } > /tmp/pr-body.md
+          gh pr create \
+            --title "chore: bump node base image to ${TO_TAG}" \
+            --body-file /tmp/pr-body.md \
+            --label dependencies \
+            --head "${BRANCH}" \
+            --base main
+
+      - name: Open base image digest drift PR (same tag, rebuilt manifest)
+        if: steps.detect.outputs.digestDrift != ''
+        env:
+          DIGEST: ${{ steps.detect.outputs.digestDrift }}
+        run: |
+          set -euo pipefail
+          TO_DIGEST="$(jq -r .to <<<"${DIGEST}")"
+          CURRENT_TAG="$(grep '^NODE_IMAGE_TAG=' zcode-version.env | cut -d= -f2)"
+          BRANCH="chore/base-digest-$(date +%Y%m%d)"
+          OPEN="$(gh pr list --head "${BRANCH}" --state open --json number | jq length)"
+          [ "${OPEN}" = "0" ] || { echo "PR for ${BRANCH} already open; skipping"; exit 0; }
+          git fetch origin main --quiet
+          git checkout -B "${BRANCH}" origin/main
+          node scripts/check-upstream-update.mjs --apply digest
+          git add zcode-version.env
+          git diff --cached --quiet && { echo "nothing to commit; skipping"; exit 0; }
+          git commit -m "chore: bump base image digest to ${TO_DIGEST}"
+          # --force is safe: the branch is always regenerated from origin/main
+          # (covers same-day reruns after a closed-unmerged PR; N1 from review)
+          git push --force "https://github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          {
+            echo "## Base image digest update for review"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| new digest | \`${TO_DIGEST}\` |"
+            echo ""
+            echo "The tag (\`${CURRENT_TAG}\`) is unchanged; the multi-arch index"
+            echo "it resolves to was rebuilt upstream. Review and merge to rebuild."
+          } > /tmp/pr-body.md
+          gh pr create \
+            --title "chore: bump base image digest (${TO_DIGEST:0:19})" \
+            --body-file /tmp/pr-body.md \
+            --label dependencies \
+            --head "${BRANCH}" \
+            --base main

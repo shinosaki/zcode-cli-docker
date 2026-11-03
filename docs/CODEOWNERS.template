@@ -1,0 +1,15 @@
+# CODEOWNERS — 設置テンプレート
+#
+# <OWNER> をあなたのGitHubユーザー名/チームに置き換えて
+# .github/CODEOWNERS として保存してください（READMEの手順2参照）。
+#
+# 供給網防御の中核ファイル。**全て**オーナーレビュー必須にすること:
+# - zcode-version.env      : 何をビルドするかの全ピン
+# - scripts/verify-pin.mjs : ピン検証の正（canonical parser）。これが
+#                            PRで書き換えられるとCI検証そのものが無効化される
+# - .github/workflows/     : 権限・署名・公開フローの定義
+* @OWNER
+/zcode-version.env @OWNER
+/scripts/verify-pin.mjs @OWNER
+/scripts/ @OWNER
+/.github/workflows/ @OWNER

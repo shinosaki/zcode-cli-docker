@@ -1,0 +1,14 @@
+# Keep the pinned action SHAs in our workflows fresh.
+# Dependabot resolves the version comment (`# vX.Y.Z`) and opens a PR that
+# updates the pinned SHA. A human merges — same gate as our own update PRs.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    # Actions are infrastructure, not product: allow direct main-branch PRs
+    # without grouping so each SHA bump stays individually reviewable.
+    open-pull-requests-limit: 5
