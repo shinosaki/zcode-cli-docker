@@ -51,9 +51,10 @@ RUN echo "${ZCODE_TAG}"    | grep -Eqx '^v(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3
   && echo "${MINIMUM_RELEASE_AGE_MINUTES}" | grep -Eqx '^[0-9]+$'
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Builder needs git (fetch the pinned tag) and nothing else beyond the base image.
+# Builder needs git plus the native toolchain used by node-gyp fallbacks.
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates \
+  && apt-get install -y --no-install-recommends \
+       git ca-certificates python3 build-essential \
   && rm -rf /var/lib/apt/lists/*
 
 # -- pnpm: exact version, official registry, pinned integrity (canary) ---------
@@ -93,6 +94,7 @@ RUN git init -q /src \
 ENV npm_config_registry=${NPM_REGISTRY}
 RUN pnpm install --frozen-lockfile \
       --config.minimum-release-age="${MINIMUM_RELEASE_AGE_MINUTES}" \
+  --network-concurrency=8 \
       --filter "@zcode/cli..." --filter "@zcode/server..." --filter "@zcode/web..."
 
 # @zcode/shared is a source-only package that upstream's SEA/TUI asset staging
